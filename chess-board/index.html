@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Chess · Resonate</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: #000;
+      font-family: 'Courier New', 'Lucida Console', monospace;
+      height: 100vh;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    header {
+      height: 48px;
+      display: flex;
+      align-items: center;
+      padding: 0 2rem;
+      border-bottom: 1px solid #141414;
+      flex-shrink: 0;
+    }
+
+    header img {
+      height: 18px;
+      opacity: 0.9;
+      filter: invert(1);
+    }
+
+    #board {
+      flex: 1;
+      min-height: 0;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <img src="./echo.png" alt="Resonate" />
+  </header>
+
+  <main style="flex:1;min-height:0;display:flex;">
+    <div id="board" style="flex:1;"></div>
+  </main>
+
+  <script type="importmap">
+    { "imports": { "three": "https://esm.sh/three@0.160.0" } }
+  </script>
+
+  <script type="module">
+    // ── Firebase config ───────────────────────────────────────────────────────
+    const firebaseConfig = {
+      apiKey:    "AIzaSyBfiuoO01qAU0r0OBHvpnxwZ0wIF8QA6eU",
+      authDomain: "resonate-chess.firebaseapp.com",
+      projectId: "resonate-chess",
+    };
+    // ─────────────────────────────────────────────────────────────────────────
+
+    import { initializeApp }                from "https://www.gstatic.com/firebasejs/10.14.0/firebase-app.js";
+    import { getFirestore, doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.14.0/firebase-firestore.js";
+    import { ChessScene }                   from "./chess-scene.js";
+
+    const scene = new ChessScene(document.getElementById("board"), {
+      tileElevation: 0,
+      backgroundColor: '#000000',
+      camPhi: Math.PI * 0.28,
+      camRadius: 19.0,
+      materials: {
+        frame:       { color: '#d0d0d0', roughness: 0.30, metalness: 0.0 },
+        lightSquare: { color: '#64748B', roughness: 0.12, metalness: 0.0 },
+        darkSquare:  { color: '#334155', roughness: 0.12, metalness: 0.0 },
+        whitePiece:  { color: '#ffffff', roughness: 0.08, metalness: 0.0 },
+        blackPiece:  { color: '#060606', roughness: 0.08, metalness: 0.0 },
+      },
+      logoUrl:     './echo.png',
+      logoOpacity: 0.75,
+      logoSquare:  'f5',
+      logoColor:   '#f6f6f6',
+    });
+
+    const app     = initializeApp(firebaseConfig);
+    const db      = getFirestore(app);
+    const gameRef = doc(db, "chess-games", "current");
+
+    onSnapshot(gameRef, async (snapshot) => {
+      if (!snapshot.exists()) return;
+      const data = snapshot.data();
+      if (!data.gameOver) await scene.next(data);
+    });
+  </script>
+</body>
+</html>
