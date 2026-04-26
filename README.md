@@ -2,6 +2,10 @@
 
 An AI-vs-AI chess game powered by [Resonate](https://resonatehq.io) durable execution, running on Google Cloud Platform. Two AI players compete move by move; each move is a durably-executed step, so if the process crashes mid-game it resumes from the next pending step instead of restarting the match.
 
+Live demo: https://resonatehq-examples.github.io/resonate-chess-gcp/
+
+![Chess · Resonate](chess-board/chess.jpg)
+
 ```typescript
 export function* chessGame(context: Context) {
   
