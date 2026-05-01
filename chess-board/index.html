@@ -86,10 +86,6 @@
     <div id="board" style="flex:1;"></div>
   </main>
 
-  <script type="importmap">
-    { "imports": { "three": "https://esm.sh/three@0.160.0" } }
-  </script>
-
   <script type="module">
     // ── Firebase config ───────────────────────────────────────────────────────
     const firebaseConfig = {
@@ -103,23 +99,7 @@
     import { getFirestore, doc, onSnapshot } from "https://www.gstatic.com/firebasejs/10.14.0/firebase-firestore.js";
     import { ChessScene }                   from "./chess-scene.js";
 
-    const scene = new ChessScene(document.getElementById("board"), {
-      tileElevation: 0,
-      backgroundColor: '#000000',
-      camPhi: Math.PI * 0.28,
-      camRadius: 19.0,
-      materials: {
-        frame:       { color: '#d0d0d0', roughness: 0.30, metalness: 0.0 },
-        lightSquare: { color: '#64748B', roughness: 0.12, metalness: 0.0 },
-        darkSquare:  { color: '#334155', roughness: 0.12, metalness: 0.0 },
-        whitePiece:  { color: '#ffffff', roughness: 0.08, metalness: 0.0 },
-        blackPiece:  { color: '#060606', roughness: 0.08, metalness: 0.0 },
-      },
-      logoUrl:     './echo.png',
-      logoOpacity: 0.75,
-      logoSquare:  'f5',
-      logoColor:   '#f6f6f6',
-    });
+    const scene = new ChessScene(document.getElementById("board"));
 
     const app     = initializeApp(firebaseConfig);
     const db      = getFirestore(app);
