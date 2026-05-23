@@ -183,39 +183,34 @@ export class ChessScene {
   }
 
   next(state) {
-    if (this.disposed || !state || state.gameOver) return Promise.resolve();
-    const { fen, san } = state;
+    if (this.disposed || !state || state.isGameOver) return Promise.resolve();
+    const { fen, lastMove, isCheck, turn } = state;
     if (!fen) return Promise.resolve();
 
     let move = null;
-    if (san) {
-      try {
-        const game = new Chess(this.fen);
-        const m = game.move(san);
-        if (m) {
-          move = {
-            from: m.from,
-            to: m.to,
-            captured: !!m.captured,
-            isCheck: game.inCheck(),
-            kingSq: null,
-          };
-          if (move.isCheck) {
-            const sideToMove = game.turn();
-            const board = game.board();
-            outer: for (let r = 0; r < 8; r++) {
-              for (let c = 0; c < 8; c++) {
-                const cell = board[r]?.[c];
-                if (cell && cell.type === "k" && cell.color === sideToMove) {
-                  move.kingSq = { col: c, row: r };
-                  break outer;
-                }
+    if (lastMove?.from && lastMove?.to) {
+      move = {
+        from: lastMove.from,
+        to: lastMove.to,
+        captured: !!lastMove.captured,
+        isCheck: !!isCheck,
+        kingSq: null,
+      };
+      if (move.isCheck && turn) {
+        try {
+          const board = new Chess(fen).board();
+          outer: for (let r = 0; r < 8; r++) {
+            for (let c = 0; c < 8; c++) {
+              const cell = board[r]?.[c];
+              if (cell && cell.type === "k" && cell.color === turn) {
+                move.kingSq = { col: c, row: r };
+                break outer;
               }
             }
           }
+        } catch {
+          // invalid FEN — leave kingSq null
         }
-      } catch {
-        // FEN/SAN mismatch — fall through and just render the new position.
       }
     }
 
