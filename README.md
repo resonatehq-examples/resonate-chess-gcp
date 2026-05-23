@@ -78,13 +78,15 @@ Browser clients subscribe via Firebase JS SDK `onSnapshot('chess/live')`. The `c
 
 ## Cost Profile
 
-| Resource | Smallest option | Approximate cost |
-|----------|-----------------|-----------------|
-| Cloud SQL | `db-f1-micro` | ~$7/month |
-| Resonate Server | Cloud Run, 1 min instance, 256MB | ~$5/month |
-| Chess Function | Cloud Functions Gen2, 512MB, ~5s active every ~4.5s | ~$3/month |
+| Resource | Sizing | Cost |
+|----------|--------|------|
+| Cloud SQL | `db-f1-micro` | ~$7/mo |
+| Resonate Server | Cloud Run, 1 min instance, 256MB | ~$5/mo |
+| Chess Function | Cloud Functions Gen2, 512MB, ~5s active every ~4.5s | ~$3/mo |
 | Firestore | free tier covers hobby use | $0 |
-| Anthropic API | Haiku 4.5, ~1 call per Black move, prompt cached | depends on traffic |
+| Anthropic API | ~1 Haiku 4.5 call per 9s (~300k calls/mo) | **~$50–150/mo** |
+
+The Anthropic line is the real cost driver — the bot runs continuously, so the spend is steady-state regardless of viewers. The range reflects uncertainty in average game length and prompt-cache hit rate. Switch the player back to engine-vs-engine (delete `agentPlayer` and route both sides to `enginePlayer`) to drop this to $0.
 
 ## Files
 
@@ -95,13 +97,32 @@ Browser clients subscribe via Firebase JS SDK `onSnapshot('chess/live')`. The `c
 
 ## Deploy
 
-The Cloud Function needs an Anthropic API key for the Black player. Set it as a secret in your project first:
+### One-time setup (per GCP project)
 
 ```bash
-echo -n "<ANTHROPIC_API_KEY>" | gcloud secrets create anthropic-api-key --data-file=-
+# Anthropic API key for the Black player. Create the secret, or add a new
+# version if it already exists.
+echo -n "<ANTHROPIC_API_KEY>" | gcloud secrets create anthropic-api-key \
+  --data-file=- --project=<gcp-project> \
+  || echo -n "<ANTHROPIC_API_KEY>" | gcloud secrets versions add anthropic-api-key \
+       --data-file=- --project=<gcp-project>
+
+# Firestore rules — re-deploy whenever firestore.rules changes.
+firebase deploy --only firestore:rules --project=<gcp-project>
 ```
 
-Then deploy the worker:
+### Migrating from a prior deployment (the order matters)
+
+If a `chessGame` chain is already running on the Resonate server (from a prior version of this worker), **drain it before deploying new code**. Otherwise the in-flight workflow replays through the new code path with mismatched promise value shapes (older child-promise values were plain UCI strings; new code destructures `{move, reasoning}`) and crashes with `Invalid move: undefined`, poisoning the chain.
+
+```bash
+# 1) Cancel any in-flight chain first (idempotent — safe if none exist)
+resonate promises search --state pending --server <resonate-server-url> \
+  | jq -r '.promises[].id' | grep -i chess \
+  | xargs -r -I{} resonate promises cancel {} --server <resonate-server-url>
+```
+
+### Deploy the worker
 
 ```bash
 cd chess-match
@@ -114,15 +135,43 @@ gcloud functions deploy chess-match \
   --set-env-vars=RESONATE_URL=<resonate-server-url> \
   --set-secrets=ANTHROPIC_API_KEY=anthropic-api-key:latest \
   --project=<gcp-project>
+
+# Capture the function URL for the seed command below.
+FUNCTION_URL=$(gcloud functions describe chess-match --gen2 \
+  --region=us-central1 --project=<gcp-project> \
+  --format='value(serviceConfig.uri)')
+echo "$FUNCTION_URL"
 ```
 
-Kick off the chain once (each game self-detaches the next):
+### Seed the chain
 
 ```bash
-resonate invoke chess-game-1 \
-  --func chessGame \
-  --data '{"args":[1]}' \
+# Pick the next free game number. The Resonate server rejects duplicate IDs,
+# so if chess-game-1 was used in a prior deployment, bump to 2, 3, etc.
+# (Or use a UUID suffix: chess-game-$(uuidgen | tr -d '-' | head -c 8).)
+SEED_ID=chess-game-1
+
+resonate promises get "$SEED_ID" --server <resonate-server-url> 2>/dev/null \
+  && { echo "ID $SEED_ID already exists — bump SEED_ID and retry."; exit 1; }
+
+resonate invoke "$SEED_ID" \
+  --func chessGame --data '{"args":[1]}' \
   --server <resonate-server-url> \
-  --target <function-url> \
+  --target "$FUNCTION_URL" \
   --timeout 24h
+```
+
+### Rollback
+
+If the new deployment misbehaves (runaway Anthropic calls, crashing chain, etc.):
+
+```bash
+# Kill the chain immediately to stop Anthropic spend.
+resonate promises search --state pending --server <resonate-server-url> \
+  | jq -r '.promises[].id' | grep -i chess \
+  | xargs -r -I{} resonate promises cancel {} --server <resonate-server-url>
+
+# Re-deploy the prior version. With this repo, `git checkout <prior-sha> -- chess-match`
+# then re-run the deploy command above. Without git, redeploying from your last
+# known-good `dist/` works too.
 ```

@@ -82,6 +82,14 @@ async function enginePlayer(_ctx: Context, fen: string, level: number): Promise<
   return `${from.toLowerCase()}${to.toLowerCase()}`;
 }
 
+// agentPlayer is not Resonate-specific — it's a Claude-API surface (structured
+// output + schema validation + retry/fallback). The "Resonate-shaped" code in
+// this file is small: the `chessGame` generator above, the `publish` ctx.run,
+// and the `ctx.detached(chessGame, n+1)` self-restart pattern that bounds
+// replay scope to a single game. Everything below this comment is plumbing
+// around the language model; treat it as one example of an LLM player rather
+// than as Resonate guidance.
+
 async function agentPlayer(
   _ctx: Context,
   fen: string,
@@ -160,6 +168,7 @@ async function agentPlayer(
 
 async function publish(ctx: Context, state: Record<string, unknown>): Promise<void> {
   const db = ctx.getDependency("firestore") as Firestore;
+  console.log("[publish]", JSON.stringify(state));
   await db.collection("chess").doc("live").set(state);
 }
 

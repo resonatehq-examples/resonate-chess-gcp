@@ -108,7 +108,9 @@
     onSnapshot(gameRef, async (snapshot) => {
       if (!snapshot.exists()) return;
       const data = snapshot.data();
-      if (!data.isGameOver) await scene.next(data);
+      // ChessScene.next is tolerant of both rich state (isGameOver) and the
+      // simpler {gameOver} shape, so just pass the snapshot through.
+      await scene.next(data);
     });
   </script>
 </body>

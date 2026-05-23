@@ -183,26 +183,31 @@ export class ChessScene {
   }
 
   next(state) {
-    if (this.disposed || !state || state.isGameOver) return Promise.resolve();
-    const { fen, lastMove, isCheck, turn } = state;
+    // Accepts either rich state ({fen, lastMove:{from,to,captured}, isCheck,
+    // turn, isGameOver}) or thin state ({fen, san, gameOver}) — derives the
+    // missing pieces from FEN+SAN when the backend doesn't publish them.
+    if (this.disposed || !state) return Promise.resolve();
+    if (state.isGameOver || state.gameOver) return Promise.resolve();
+
+    const fen = state.fen;
     if (!fen) return Promise.resolve();
 
     let move = null;
-    if (lastMove?.from && lastMove?.to) {
+    if (state.lastMove?.from && state.lastMove?.to) {
       move = {
-        from: lastMove.from,
-        to: lastMove.to,
-        captured: !!lastMove.captured,
-        isCheck: !!isCheck,
+        from: state.lastMove.from,
+        to: state.lastMove.to,
+        captured: !!state.lastMove.captured,
+        isCheck: !!state.isCheck,
         kingSq: null,
       };
-      if (move.isCheck && turn) {
+      if (move.isCheck && state.turn) {
         try {
           const board = new Chess(fen).board();
           outer: for (let r = 0; r < 8; r++) {
             for (let c = 0; c < 8; c++) {
               const cell = board[r]?.[c];
-              if (cell && cell.type === "k" && cell.color === turn) {
+              if (cell && cell.type === "k" && cell.color === state.turn) {
                 move.kingSq = { col: c, row: r };
                 break outer;
               }
@@ -211,6 +216,37 @@ export class ChessScene {
         } catch {
           // invalid FEN — leave kingSq null
         }
+      }
+    } else if (state.san) {
+      // Fallback for backends that publish only {fen, san}: replay the SAN
+      // against the prior position to derive from/to/captured/isCheck.
+      try {
+        const game = new Chess(this.fen);
+        const m = game.move(state.san);
+        if (m) {
+          move = {
+            from: m.from,
+            to: m.to,
+            captured: !!m.captured,
+            isCheck: game.inCheck(),
+            kingSq: null,
+          };
+          if (move.isCheck) {
+            const sideToMove = game.turn();
+            const board = game.board();
+            outer: for (let r = 0; r < 8; r++) {
+              for (let c = 0; c < 8; c++) {
+                const cell = board[r]?.[c];
+                if (cell && cell.type === "k" && cell.color === sideToMove) {
+                  move.kingSq = { col: c, row: r };
+                  break outer;
+                }
+              }
+            }
+          }
+        }
+      } catch {
+        // FEN/SAN mismatch — fall through and just render the new position.
       }
     }
 
