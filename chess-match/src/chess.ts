@@ -61,6 +61,10 @@ export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, a
     const move = applyUciMove(game, uci);
     moveCount++;
 
+    // White is a deterministic engine — no LLM reasoning. Synthesize a short
+    // mechanical line from the Move so the reasoning panel reads symmetrically.
+    if (side === "w") reasoning = engineReasoning(move, WHITE_LEVEL);
+
     yield* ctx.run(publish, buildState(game, move, moveCount, reasoning));
     yield* ctx.sleep(MOVE_DELAY_MS);
   }
@@ -216,6 +220,39 @@ function buildState(
     state.result = "draw";
   }
   return state;
+}
+
+const PIECE_NAME: Record<string, string> = {
+  p: "pawn",
+  n: "knight",
+  b: "bishop",
+  r: "rook",
+  q: "queen",
+  k: "king",
+};
+
+function engineReasoning(move: Move, level: number): string {
+  const piece = PIECE_NAME[move.piece] ?? move.piece;
+  const flags = move.flags ?? "";
+
+  let action: string;
+  if (flags.includes("k")) {
+    action = "king castles kingside";
+  } else if (flags.includes("q")) {
+    action = "king castles queenside";
+  } else if (move.captured) {
+    const cap = PIECE_NAME[move.captured] ?? "piece";
+    action = `${piece} ${move.from}→${move.to} captures the ${cap}`;
+  } else {
+    action = `${piece} ${move.from}→${move.to}`;
+  }
+
+  if (move.promotion) {
+    const promoted = PIECE_NAME[move.promotion] ?? move.promotion;
+    action += `, promotes to ${promoted}`;
+  }
+
+  return `depth-${level} minimax search · ${action}.`;
 }
 
 function legalMovesUci(game: Chess): string[] {
