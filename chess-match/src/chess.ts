@@ -71,7 +71,20 @@ export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, a
   // game. Detaching here breaks lineage: the next game has its own origin and
   // won't replay this game's promise tree. Forever-loops inside a single
   // durable invocation eventually hit a replay-vs-lease cliff (1199 errors).
-  yield* ctx.detached(chessGame, gameNumber + 1);
+  //
+  // We also pass an explicit `id` so the next game's promise ID is bounded
+  // (`chess-game-N`). Without it, the SDK auto-generates IDs as
+  // `<parentId>.<hash>`, which means every detached generation appends a
+  // segment. After enough iterations the ID grows large enough that the
+  // server's task.suspend payload overflows (HTTP 500), the chain freezes,
+  // and you have to cancel + reseed. The `as any` is because the SDK's
+  // `ctx.options()` type signature declares `Partial<Omit<Options, "id">>`,
+  // but the underlying OptionsBuilder + splitArgsAndOpts both accept and
+  // use `id` at runtime — only the type surface blocks it. See the SDK
+  // issue tracking the type fix.
+  const nextOpts = ctx.options();
+  (nextOpts as { id?: string }).id = `chess-game-${gameNumber + 1}`;
+  yield* ctx.detached(chessGame, gameNumber + 1, nextOpts);
 }
 
 // ── Players ───────────────────────────────────────────────────────────────────

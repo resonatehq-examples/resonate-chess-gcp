@@ -40,11 +40,15 @@ Every Google Cloud Function invocation has two phases: replay and resume. On rep
 
 When execution reaches a pending `ctx.sleep()`, the workflow suspends and the current invocation ends. The Resonate server waits for the timer promise to complete, then starts a fresh invocation.
 
-### One game = one root promise
+### One game = one root promise (with a bounded ID)
 
-`chessGame` resolves at game-over. The last yield is `ctx.detached(chessGame, n + 1)`, which starts the next game as a brand-new root with its own origin id. Replay scope is bounded to a single game forever, regardless of how long the demo runs.
+`chessGame` resolves at game-over. The last yield is `ctx.detached(chessGame, n + 1, { id: "chess-game-N+1" })`, which starts the next game as a brand-new root with its own origin id. Replay scope is bounded to a single game forever, regardless of how long the demo runs.
 
-A previous shape was `while(true) { play one game }` inside a single durable invocation. After thousands of accumulated child promises, each replay took longer than the task lease and the server would reassign tasks mid-execution (`code 1199 — Task is not acquired`). The detach-per-game shape avoids that entirely.
+Two failure modes informed this shape:
+
+1. **Replay-vs-lease cliff (`code 1199`).** A previous version used `while(true) { play one game }` inside a single durable invocation. After thousands of accumulated child promises, each replay took longer than the task lease and the server would reassign tasks mid-execution. The detach-per-game shape fixes this — each game's promise tree is bounded.
+
+2. **Unbounded ID growth.** Without an explicit `id` on `ctx.detached(...)`, the SDK auto-generates IDs as `<parentId>.<hash>`. Across thousands of games the parent chain accumulates — a ~5000-game chain produces a task id of several KB. Eventually the `task.suspend` payload exceeds what the server can process (HTTP 500) and the chain freezes. The `id: "chess-game-N+1"` argument keeps the next game's ID short and predictable forever.
 
 `@resonatehq/gcp` defaults `ttl` (acquired-task lease) to 5min. We set it to 10min in `index.ts` so it always exceeds the Cloud Function's 540s timeout — belt-and-braces against any single invocation that legitimately runs long.
 
