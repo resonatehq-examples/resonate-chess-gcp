@@ -40,15 +40,22 @@ Every Google Cloud Function invocation has two phases: replay and resume. On rep
 
 When execution reaches a pending `ctx.sleep()`, the workflow suspends and the current invocation ends. The Resonate server waits for the timer promise to complete, then starts a fresh invocation.
 
-### One game = one root promise (with a bounded ID)
+### One game = one root promise
 
-`chessGame` resolves at game-over. The last yield is `ctx.detached(chessGame, n + 1, { id: "chess-game-N+1" })`, which starts the next game as a brand-new root with its own origin id. Replay scope is bounded to a single game forever, regardless of how long the demo runs.
+`chessGame` resolves at game-over. The last yield is `ctx.detached(chessGame, n + 1)`, which starts the next game as a brand-new root with its own origin id. Replay scope is bounded to a single game forever, regardless of how long the demo runs.
 
-Two failure modes informed this shape:
+This shape was a deliberate fix for the **replay-vs-lease cliff (`code 1199`)**. A previous version used `while(true) { play one game }` inside a single durable invocation. After thousands of accumulated child promises, each replay took longer than the task lease and the server would reassign tasks mid-execution. The detach-per-game shape avoids that — each game's promise tree is bounded.
 
-1. **Replay-vs-lease cliff (`code 1199`).** A previous version used `while(true) { play one game }` inside a single durable invocation. After thousands of accumulated child promises, each replay took longer than the task lease and the server would reassign tasks mid-execution. The detach-per-game shape fixes this — each game's promise tree is bounded.
+We've separately observed that long-running self-detaching chains accumulate `task_id` segments per generation, which eventually overflows server `task.suspend` payloads and freezes the chain (HTTP 500 from the server on suspend). Conversation about that is at https://github.com/resonatehq/resonate-sdk-ts/issues/526 — for now we follow the SDK-blessed shape and accept periodic re-seeding as the operational pattern until the SDK guidance evolves. To re-seed, cancel any pending `chess-game-*` promises and invoke a fresh integer suffix:
 
-2. **Unbounded ID growth.** Without an explicit `id` on `ctx.detached(...)`, the SDK auto-generates IDs as `<parentId>.<hash>`. Across thousands of games the parent chain accumulates — a ~5000-game chain produces a task id of several KB. Eventually the `task.suspend` payload exceeds what the server can process (HTTP 500) and the chain freezes. The `id: "chess-game-N+1"` argument keeps the next game's ID short and predictable forever.
+```bash
+resonate promises search --state pending --server <resonate-server-url> \
+  | jq -r '.promises[].id' | grep -i chess \
+  | xargs -r -I{} resonate promises cancel {} --server <resonate-server-url>
+
+resonate invoke chess-game-<N> --func chessGame --arg <N> \
+  --server <resonate-server-url> --target <function-url> --timeout 24h
+```
 
 `@resonatehq/gcp` defaults `ttl` (acquired-task lease) to 5min. We set it to 10min in `index.ts` so it always exceeds the Cloud Function's 540s timeout — belt-and-braces against any single invocation that legitimately runs long.
 
