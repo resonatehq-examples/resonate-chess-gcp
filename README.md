@@ -117,8 +117,8 @@ The Anthropic line is the real cost driver — the bot runs continuously, so the
 ### One-time setup (per GCP project)
 
 ```bash
-# Anthropic API key for the Black player. Create the secret, or add a new
-# version if it already exists.
+# Anthropic API key for both players (White and Black are both Claude). Create
+# the secret, or add a new version if it already exists.
 echo -n "<ANTHROPIC_API_KEY>" | gcloud secrets create anthropic-api-key \
   --data-file=- --project=<gcp-project> \
   || echo -n "<ANTHROPIC_API_KEY>" | gcloud secrets versions add anthropic-api-key \
@@ -130,7 +130,7 @@ firebase deploy --only firestore:rules --project=<gcp-project>
 
 ### Migrating from a prior deployment (the order matters)
 
-If a `chessGame` chain is already running on the Resonate server (from a prior version of this worker), **drain it before deploying new code**. Otherwise the in-flight workflow replays through the new code path with mismatched promise value shapes (older child-promise values were plain UCI strings; new code destructures `{move, reasoning}`) and crashes with `Invalid move: undefined`, poisoning the chain.
+If a `chessGame` chain is already running on the Resonate server (from a prior version of this worker), **drain it before deploying new code**. Otherwise the in-flight workflow replays through the new code path with mismatched promise value shapes — under the old engine path White's move promise was a plain UCI `string`, but the new code always destructures `{move, reasoning}` — and crashes with `Invalid move: undefined`, poisoning the chain.
 
 ```bash
 # 1) Cancel any in-flight chain first (idempotent — safe if none exist)
