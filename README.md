@@ -1,6 +1,6 @@
 # Chess on GCP with Resonate
 
-A live AI-vs-AI chess game powered by [Resonate](https://resonatehq.io) durable execution, running on Google Cloud Platform. White is a deterministic chess engine, Black is Claude Haiku 4.5 — each move is a durably-executed step, so if the process crashes mid-game it resumes from the next pending step instead of restarting the match.
+A live agent-vs-agent chess game powered by [Resonate](https://resonatehq.io) durable execution, running on Google Cloud Platform. Both players are Claude Haiku 4.5 — the **same durable agent loop forked twice**, differing only by system prompt (White plays aggressively, Black positionally). Each move is a durably-executed step, so if the process crashes mid-game it resumes from the next pending step instead of restarting the match.
 
 Live demo: https://resonatehq-examples.github.io/resonate-chess-gcp/
 
@@ -16,14 +16,16 @@ export function* chessGame(ctx: Context, gameNumber = 1) {
   yield* ctx.run(publish, buildState(game, undefined, moveCount));
 
   while (!game.isGameOver()) {
-    const uci = game.turn() === "w"
-      ? yield* ctx.run(enginePlayer, game.fen(), WHITE_LEVEL)
-      : (yield* ctx.run(agentPlayer, game.fen(), legalMovesUci(game), recentHistory(game))).move;
+    // Same call for both players — only the side (and so the system prompt)
+    // changes. An LLM call is just a durable step.
+    const { move: uci, reasoning } = yield* ctx.run(
+      agentPlayer, game.turn(), game.fen(), legalMovesUci(game), recentHistory(game),
+    );
 
     const move = applyUciMove(game, uci);
     moveCount++;
 
-    yield* ctx.run(publish, buildState(game, move, moveCount));
+    yield* ctx.run(publish, buildState(game, move, moveCount, reasoning));
     yield* ctx.sleep(MOVE_DELAY_MS);
   }
 
@@ -75,7 +77,7 @@ Each move publishes a snapshot to Firestore at `chess/live`:
   isGameOver: boolean,
   updatedAt: number,
   lastMove?: { from: string, to: string, captured?: string },
-  agentReasoning?: string,   // Black's one-sentence reason for the move
+  agentReasoning?: string,   // the mover's one-sentence reason (set for both sides)
   result?: "white" | "black" | "draw",
 }
 ```
@@ -84,8 +86,12 @@ Browser clients subscribe via Firebase JS SDK `onSnapshot('chess/live')`. The `c
 
 ## Players
 
-- **White** — `js-chess-engine` at level 3 (pure JS, deterministic minimax). Pulled in as a Cloud Function dep, no native binary or WASM.
-- **Black** — Claude Haiku 4.5 via the Anthropic SDK. Returns `{ move, reasoning }` as structured JSON output, validated against the legal-moves list with up to 2 retries on invalid output, then falls back to a random legal move if all retries fail.
+Both players are the **same** `agentPlayer` function — one Claude Haiku 4.5 agent loop, called with a different `side`. The only thing that differs is the system prompt:
+
+- **White** — Claude Haiku 4.5, aggressive prompt (seize initiative, open lines, take tactical chances).
+- **Black** — Claude Haiku 4.5, positional prompt (solid structure, safe king, favorable trades).
+
+Each returns `{ move, reasoning }` as structured JSON output, validated against the legal-moves list with up to 2 retries on invalid output, then falls back to a random legal move if all retries fail. Same model, same tools (the legal-move list), same finish line — that's "fork one durable loop and reshape it" made literal.
 
 ## Cost Profile
 
@@ -95,9 +101,9 @@ Browser clients subscribe via Firebase JS SDK `onSnapshot('chess/live')`. The `c
 | Resonate Server | Cloud Run, 1 min instance, 256MB | ~$5/mo |
 | Chess Function | Cloud Functions Gen2, 512MB, ~5s active every ~4.5s | ~$3/mo |
 | Firestore | free tier covers hobby use | $0 |
-| Anthropic API | ~1 Haiku 4.5 call per 9s (~300k calls/mo) | **~$50–150/mo** |
+| Anthropic API | ~1 Haiku 4.5 call per ~4.5s — **both sides are now agents** (~600k calls/mo) | **~$100–300/mo** |
 
-The Anthropic line is the real cost driver — the bot runs continuously, so the spend is steady-state regardless of viewers. The range reflects uncertainty in average game length and prompt-cache hit rate. Switch the player back to engine-vs-engine (delete `agentPlayer` and route both sides to `enginePlayer`) to drop this to $0.
+The Anthropic line is the real cost driver — the bot runs continuously, so the spend is steady-state regardless of viewers. Moving from engine-vs-agent to **agent-vs-agent roughly doubles this line** (every move is now a Claude call, not every other move). The range reflects uncertainty in average game length and prompt-cache hit rate; the two distinct system prompts each cache separately. To cut cost: widen `MOVE_DELAY_MS` (fewer moves/hour), or route one side to a local engine.
 
 ## Files
 
