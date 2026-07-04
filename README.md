@@ -59,6 +59,8 @@ resonate invoke chess-game-<N> --func chessGame --arg <N> \
   --server <resonate-server-url> --target <function-url> --timeout 24h
 ```
 
+On an Anthropic API outage (429, network error, revoked key), `agentPlayer` retries within the function up to `AGENT_MAX_RETRIES` times, then rethrows. Resonate catches the rethrow and backs off exponentially (1 s, 2 s, 4 s … up to 60 s per attempt) for up to 15 Resonate-level retries, self-healing outages of roughly 20 minutes; beyond that the promise chain rejects and the documented manual re-seed applies. No random fallback moves are played while the API is down.
+
 `@resonatehq/gcp` defaults `ttl` (acquired-task lease) to 5min. We set it to 10min in `index.ts` so it always exceeds the Cloud Function's 540s timeout — belt-and-braces against any single invocation that legitimately runs long.
 
 ## State Bus — Firestore
@@ -172,7 +174,7 @@ resonate promises get "$SEED_ID" --server <resonate-server-url> 2>/dev/null \
   && { echo "ID $SEED_ID already exists — bump SEED_ID and retry."; exit 1; }
 
 resonate invoke "$SEED_ID" \
-  --func chessGame --data '{"args":[1]}' \
+  --func chessGame --arg 1 \
   --server <resonate-server-url> \
   --target "$FUNCTION_URL" \
   --timeout 24h

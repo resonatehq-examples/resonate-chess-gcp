@@ -1,4 +1,5 @@
 import type { Context } from "@resonatehq/sdk";
+import { Exponential } from "@resonatehq/sdk/dist/retries.js";
 import type { Firestore } from "@google-cloud/firestore";
 import Anthropic from "@anthropic-ai/sdk";
 import { Chess, type Move, type Square } from "chess.js";
@@ -51,6 +52,13 @@ type AgentMove = z.infer<typeof AgentMoveSchema>;
 
 const anthropic = new Anthropic();
 
+// Bounded Resonate-level retry policy for agentPlayer ctx.run calls.
+// On an API outage the step backs off exponentially (1s, 2s, 4s … up to 60s)
+// for up to 15 retries (~20 min total headroom), then rejects the promise.
+// The chain rejects, the board freezes, and a manual re-seed restarts the game
+// — see the Operations section in the README.
+const AGENT_RETRY_POLICY = new Exponential({ delay: 1000, factor: 2, maxRetries: 15, maxDelay: 60000 });
+
 // ── Game ──────────────────────────────────────────────────────────────────────
 
 export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, any> {
@@ -72,6 +80,7 @@ export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, a
       game.fen(),
       legalMovesUci(game),
       recentHistory(game),
+      ctx.options({ retryPolicy: AGENT_RETRY_POLICY }),
     );
 
     const move = applyUciMove(game, uci);
@@ -140,32 +149,52 @@ async function agentPlayer(
       ? `\n\nYour previous attempt was invalid: ${lastError}. Pick a move that is literally present in the legal moves list above.`
       : "";
 
-    const response = await anthropic.messages.parse({
-      model: AGENT_MODEL,
-      max_tokens: 512,
-      system: [
-        {
-          type: "text",
-          text: SYSTEM_PROMPTS[side],
-          cache_control: { type: "ephemeral" },
-        },
-      ],
-      messages: [{ role: "user", content: userMessage + correction }],
-      output_config: {
-        format: {
-          type: "json_schema",
-          schema: {
-            type: "object",
-            properties: {
-              move: { type: "string" },
-              reasoning: { type: "string" },
+    let response: Awaited<ReturnType<typeof anthropic.messages.parse>>;
+    try {
+      response = await anthropic.messages.parse({
+        model: AGENT_MODEL,
+        max_tokens: 512,
+        system: [
+          {
+            type: "text",
+            text: SYSTEM_PROMPTS[side],
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        messages: [{ role: "user", content: userMessage + correction }],
+        output_config: {
+          format: {
+            type: "json_schema",
+            schema: {
+              type: "object",
+              properties: {
+                move: { type: "string" },
+                reasoning: { type: "string" },
+              },
+              required: ["move", "reasoning"],
+              additionalProperties: false,
             },
-            required: ["move", "reasoning"],
-            additionalProperties: false,
           },
         },
-      },
-    });
+      });
+    } catch (apiErr) {
+      // API-level failure (429, network, revoked key, etc.) — this is NOT a
+      // bad-output retry. Log it, pause briefly, and count it as an attempt.
+      // We do NOT fall back to a random move on API errors: that would be
+      // dishonest for a "two Claude agents" demo.
+      const msg = apiErr instanceof Error ? apiErr.message : String(apiErr);
+      console.error(`[agentPlayer] API error (attempt ${attempt + 1}/${AGENT_MAX_RETRIES + 1}): ${msg}`);
+      if (attempt < AGENT_MAX_RETRIES) {
+        // Short in-function pause before the next attempt: 2s, 4s, 6s.
+        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+      } else {
+        // All attempts failed with API errors — rethrow so Resonate's bounded
+        // retry policy (AGENT_RETRY_POLICY) handles the outage. The game pauses
+        // until the API recovers or the retry budget is exhausted.
+        throw apiErr;
+      }
+      continue;
+    }
 
     const parsed = response.parsed_output;
     if (!parsed) {
@@ -185,6 +214,9 @@ async function agentPlayer(
     lastError = `"${candidate}" is not in the legal moves list`;
   }
 
+  // All attempts failed due to bad model output (schema-valid but illegal /
+  // malformed move). The random fallback is appropriate here: the API is
+  // responding, the model is just confused.
   const fallback = legalMoves[Math.floor(Math.random() * legalMoves.length)];
   return {
     move: fallback,

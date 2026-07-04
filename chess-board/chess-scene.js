@@ -187,7 +187,17 @@ export class ChessScene {
     // turn, isGameOver}) or thin state ({fen, san, gameOver}) — derives the
     // missing pieces from FEN+SAN when the backend doesn't publish them.
     if (this.disposed || !state) return Promise.resolve();
-    if (state.isGameOver || state.gameOver) return Promise.resolve();
+    if (state.isGameOver || state.gameOver) {
+      // Render the mating/final position before stopping animation so the
+      // board doesn't freeze on the penultimate move.
+      if (state.fen) {
+        this.fen = state.fen;
+        this.lastMove = null;
+        this.render();
+      }
+      this.disposed = true;
+      return Promise.resolve();
+    }
 
     const fen = state.fen;
     if (!fen) return Promise.resolve();
