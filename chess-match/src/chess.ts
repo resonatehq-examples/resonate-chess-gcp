@@ -9,6 +9,17 @@ import { z } from "zod";
 const MOVE_DELAY_MS = 4500;
 const GAME_PAUSE_MS = 6000;
 
+// Hard cap on game length, in plies. Every move adds durable steps that each
+// subsequent resume must replay, and replay does one server roundtrip per
+// recorded step — so per-invocation time grows linearly with the ply count.
+// Past roughly 250 plies the replay alone outgrows the Cloud Function's 540s
+// request timeout and the chain can no longer make progress: invocations 504
+// on the platform deadline and the board freezes mid-game. Two LLMs shuffling
+// a locked endgame can drift there long before the fifty-move rule ends the
+// game, so games that reach the cap are adjudicated as draws and the chain
+// detaches into the next game, which starts with an empty replay again.
+const MAX_PLIES = 160;
+
 // Both players are Claude Haiku 4.5 — the SAME agent loop, forked twice. The
 // only thing that differs between White and Black is the system prompt: one is
 // told to attack, the other to play positionally. Same model, same tools (the
@@ -66,7 +77,7 @@ export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, a
 
   yield* ctx.run(publish, buildState(game, undefined, moveCount));
 
-  while (!game.isGameOver()) {
+  while (!game.isGameOver() && moveCount < MAX_PLIES) {
     const side = game.turn();
 
     // Every move is a durable step. Asking Claude for a move is wrapped in the
@@ -91,6 +102,13 @@ export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, a
     // continuation in Postgres and re-invokes the function when the timer
     // fires. Between moves there is no long-lived process to pay for.
     yield* ctx.sleep(MOVE_DELAY_MS);
+  }
+
+  if (!game.isGameOver()) {
+    // Move cap reached — adjudicate. The position is still legal chess, so
+    // publish one final snapshot that declares the game over and drawn; the
+    // board only keys off isGameOver/result, never off chess.js state.
+    yield* ctx.run(publish, adjudicatedDrawState(game, moveCount));
   }
 
   yield* ctx.sleep(GAME_PAUSE_MS);
@@ -261,6 +279,19 @@ function buildState(
   } else if (game.isDraw() || game.isStalemate()) {
     state.result = "draw";
   }
+  return state;
+}
+
+function adjudicatedDrawState(game: Chess, moveCount: number): Record<string, unknown> {
+  const state = buildState(
+    game,
+    undefined,
+    moveCount,
+    `Adjudicated: game reached the ${MAX_PLIES}-ply cap and is scored as a draw.`,
+  );
+  state.isGameOver = true;
+  state.isDraw = true;
+  state.result = "draw";
   return state;
 }
 

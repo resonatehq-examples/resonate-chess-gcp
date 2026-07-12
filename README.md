@@ -48,6 +48,10 @@ When execution reaches a pending `ctx.sleep()`, the workflow suspends and the cu
 
 This shape was a deliberate fix for the **replay-vs-lease cliff (`code 1199`)**. A previous version used `while(true) { play one game }` inside a single durable invocation. After thousands of accumulated child promises, each replay took longer than the task lease and the server would reassign tasks mid-execution. The detach-per-game shape avoids that — each game's promise tree is bounded.
 
+### Games are capped at `MAX_PLIES`
+
+Bounding replay *per game* is only enough if a single game cannot itself grow without bound. Replay does one server roundtrip per recorded step, so per-invocation time grows linearly with the ply count — and two LLMs shuffling pieces in a locked endgame can outrun the fifty-move rule for hundreds of plies. Past roughly 250 plies the replay alone exceeds the Cloud Function's 540 s request timeout: invocations die on the platform deadline (HTTP 504), the board freezes mid-game, and no retry can ever get further than the last one. `chessGame` therefore adjudicates any game that reaches `MAX_PLIES` as a draw, publishes a final game-over snapshot, and detaches into the next game, which starts with an empty replay again.
+
 Long-running self-detaching chains used to accumulate id segments per generation, which eventually overflowed server `task.suspend` payloads and froze the chain (HTTP 500 from the server on suspend) — that history is at https://github.com/resonatehq/resonate-sdk-ts/issues/526. As of SDK 0.10.4 detached ids are bounded (a pinned `resonate:prefix` tag keeps every generation one segment past the root, see https://github.com/resonatehq/resonate-sdk-ts/pull/528), so the chain runs indefinitely and re-seeding is only needed after a chain rejection (e.g. a prolonged API outage, below). To re-seed, cancel any pending `chess-game-*` promises and invoke a fresh integer suffix:
 
 ```bash
