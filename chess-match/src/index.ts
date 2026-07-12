@@ -13,10 +13,6 @@ const resonate = new Resonate({
 const firestore = new Firestore({ ignoreUndefinedProperties: true });
 
 resonate.setDependency("firestore", firestore);
-// @resonatehq/gcp 0.2.x bundles its own SDK 0.10.x copy, so its register()
-// signature comes from a different type graph than this package's 0.11.x
-// import. The generator-engine runtime contract is identical across the two;
-// drop the assertion once the adapter depends on SDK 0.11.
-resonate.register("chessGame", chessGame as any);
+resonate.register("chessGame", chessGame);
 
 export const handler = resonate.handlerHttp();
