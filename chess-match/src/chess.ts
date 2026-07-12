@@ -1,5 +1,4 @@
-import type { Context } from "@resonatehq/sdk";
-import { Exponential } from "@resonatehq/sdk/dist/retries.js";
+import { Exponential, type Context } from "@resonatehq/sdk";
 import type { Firestore } from "@google-cloud/firestore";
 import Anthropic from "@anthropic-ai/sdk";
 import { Chess, type Move, type Square } from "chess.js";
@@ -102,13 +101,13 @@ export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, a
   // crash domain. Forever-loops inside a single durable invocation eventually
   // hit a replay-vs-lease cliff (1199 errors).
   //
-  // The SDK assigns the next promise's id automatically. We've observed that
-  // long-running self-detaching chains accumulate task_id segments per
-  // generation, which eventually overflows server task.suspend payloads and
-  // freezes the chain. Tracking that conversation at
-  // https://github.com/resonatehq/resonate-sdk-ts/issues/526 — for now we
-  // follow the SDK-blessed shape and accept periodic re-seeding as the
-  // operational pattern until the SDK guidance evolves.
+  // The SDK assigns the next promise's id automatically. SDK versions before
+  // 0.10.4 grew the id by one segment per generation, which eventually
+  // overflowed the server's task.suspend payload and froze long-running
+  // chains. The SDK now bounds detached ids via a pinned `resonate:prefix`
+  // tag (each generation is `${prefix}.d${hash}`, one segment past the prefix
+  // at every depth), so this self-detaching shape runs indefinitely without
+  // re-seeding. See https://github.com/resonatehq/resonate-sdk-ts/pull/528.
   yield* ctx.detached(chessGame, gameNumber + 1);
 }
 
