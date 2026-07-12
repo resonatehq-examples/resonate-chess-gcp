@@ -1,8 +1,8 @@
 import type { Context } from "@resonatehq/sdk";
+import { Exponential } from "@resonatehq/sdk/dist/retries.js";
 import type { Firestore } from "@google-cloud/firestore";
 import Anthropic from "@anthropic-ai/sdk";
 import { Chess, type Move, type Square } from "chess.js";
-import { Game } from "js-chess-engine";
 import { z } from "zod";
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -10,22 +10,39 @@ import { z } from "zod";
 const MOVE_DELAY_MS = 4500;
 const GAME_PAUSE_MS = 6000;
 
-// White = engine (js-chess-engine level 3). Black = Claude Haiku 4.5.
-// The resonatehq.io hero is labelled "White · js-chess-engine L3" / "Black ·
-// Claude Haiku 4.5" — these constants are what those labels are claiming.
-const WHITE_LEVEL = 3;
+// Both players are Claude Haiku 4.5 — the SAME agent loop, forked twice. The
+// only thing that differs between White and Black is the system prompt: one is
+// told to attack, the other to play positionally. Same model, same tools (the
+// legal-move list), same finish line (game over). That is the whole point the
+// resonatehq.ai hero is making: you reshape one durable loop, you don't rebuild
+// a new agent each time.
 const AGENT_MODEL = "claude-haiku-4-5-20251001";
 const AGENT_MAX_RETRIES = 2;
 
-const AGENT_SYSTEM_PROMPT = `You are playing a game of chess as Black against a deterministic opponent.
+const WHITE_SYSTEM_PROMPT = `You are playing a game of chess as White. Your style is aggressive: seize the initiative, develop with tempo, open lines toward the enemy king, and take tactical chances.
 
 Your job each turn: look at the FEN position and the list of legal moves, pick one move, and give one short sentence of reasoning.
 
 Rules for your output:
-- "move" must be one of the legal moves, verbatim, in UCI format (e.g. "e7e5", "g8f6", with promotion suffix like "e7e8q" when relevant).
-- "reasoning" is ONE sentence. Be concrete — name the piece and the goal (attack, defend, develop, trade, etc.). No filler, no hedging.
-- If you see a forced tactic (fork, pin, mate in N), say so. Otherwise prefer moves that develop pieces, control the center, and keep your king safe.
+- "move" must be one of the legal moves, verbatim, in UCI format (e.g. "e2e4", "g1f3", with promotion suffix like "e7e8q" when relevant).
+- "reasoning" is ONE sentence. Be concrete — name the piece and the goal (attack, open a file, sacrifice for initiative, etc.). No filler, no hedging.
+- If you see a forced tactic (fork, pin, mate in N), take it. Otherwise prefer moves that create threats, contest the center, and keep the initiative.
+- You are White. Do not confuse yourself with Black.`;
+
+const BLACK_SYSTEM_PROMPT = `You are playing a game of chess as Black. Your style is positional: prioritize a solid structure, a safe king, active pieces, and favorable trades over sharp risks.
+
+Your job each turn: look at the FEN position and the list of legal moves, pick one move, and give one short sentence of reasoning.
+
+Rules for your output:
+- "move" must be one of the legal moves, verbatim, in UCI format (e.g. "e7e5", "g8f6", with promotion suffix like "a2a1q" when relevant).
+- "reasoning" is ONE sentence. Be concrete — name the piece and the goal (develop, defend, trade, fix a weakness, etc.). No filler, no hedging.
+- If you see a forced tactic (fork, pin, mate in N), take it. Otherwise prefer moves that develop pieces, control the center, keep your king safe, and avoid weaknesses.
 - You are Black. Do not confuse yourself with White.`;
+
+const SYSTEM_PROMPTS: Record<"w" | "b", string> = {
+  w: WHITE_SYSTEM_PROMPT,
+  b: BLACK_SYSTEM_PROMPT,
+};
 
 const AgentMoveSchema = z.object({
   move: z.string(),
@@ -34,6 +51,13 @@ const AgentMoveSchema = z.object({
 type AgentMove = z.infer<typeof AgentMoveSchema>;
 
 const anthropic = new Anthropic();
+
+// Bounded Resonate-level retry policy for agentPlayer ctx.run calls.
+// On an API outage the step backs off exponentially (1s, 2s, 4s … up to 60s)
+// for up to 15 retries (~20 min total headroom), then rejects the promise.
+// The chain rejects, the board freezes, and a manual re-seed restarts the game
+// — see the Operations section in the README.
+const AGENT_RETRY_POLICY = new Exponential({ delay: 1000, factor: 2, maxRetries: 15, maxDelay: 60000 });
 
 // ── Game ──────────────────────────────────────────────────────────────────────
 
@@ -45,27 +69,28 @@ export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, a
 
   while (!game.isGameOver()) {
     const side = game.turn();
-    let uci: string;
-    let reasoning: string | undefined;
 
-    if (side === "w") {
-      uci = yield* ctx.run(enginePlayer, game.fen(), WHITE_LEVEL);
-    } else {
-      const legal = legalMovesUci(game);
-      const history = recentHistory(game);
-      const result = yield* ctx.run(agentPlayer, game.fen(), legal, history);
-      uci = result.move;
-      reasoning = result.reasoning;
-    }
+    // Every move is a durable step. Asking Claude for a move is wrapped in the
+    // exact same primitive — ctx.run — as writing state below: an LLM call is
+    // just a durable step. If the API flakes, the step retries; if Claude hands
+    // back an illegal move, agentPlayer corrects it before we ever apply it.
+    const { move: uci, reasoning } = yield* ctx.run(
+      agentPlayer,
+      side,
+      game.fen(),
+      legalMovesUci(game),
+      recentHistory(game),
+      ctx.options({ retryPolicy: AGENT_RETRY_POLICY }),
+    );
 
     const move = applyUciMove(game, uci);
     moveCount++;
 
-    // White is a deterministic engine — no LLM reasoning. Synthesize a short
-    // mechanical line from the Move so the reasoning panel reads symmetrically.
-    if (side === "w") reasoning = engineReasoning(move, WHITE_LEVEL);
-
     yield* ctx.run(publish, buildState(game, move, moveCount, reasoning));
+
+    // Durable suspension. The worker terminates here; the server holds the
+    // continuation in Postgres and re-invokes the function when the timer
+    // fires. Between moves there is no long-lived process to pay for.
     yield* ctx.sleep(MOVE_DELAY_MS);
   }
 
@@ -73,8 +98,9 @@ export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, a
 
   // Each game is its own root promise so replay cost stays bounded to a single
   // game. Detaching here breaks lineage: the next game has its own origin and
-  // won't replay this game's promise tree. Forever-loops inside a single
-  // durable invocation eventually hit a replay-vs-lease cliff (1199 errors).
+  // won't replay this game's promise tree — every game plays out in its own
+  // crash domain. Forever-loops inside a single durable invocation eventually
+  // hit a replay-vs-lease cliff (1199 errors).
   //
   // The SDK assigns the next promise's id automatically. We've observed that
   // long-running self-detaching chains accumulate task_id segments per
@@ -86,13 +112,7 @@ export function* chessGame(ctx: Context, gameNumber = 1): Generator<any, void, a
   yield* ctx.detached(chessGame, gameNumber + 1);
 }
 
-// ── Players ───────────────────────────────────────────────────────────────────
-
-async function enginePlayer(_ctx: Context, fen: string, level: number): Promise<string> {
-  const { move } = new Game(fen).ai({ level });
-  const [from, to] = Object.entries(move)[0] as [string, string];
-  return `${from.toLowerCase()}${to.toLowerCase()}`;
-}
+// ── Player ──────────────────────────────────────────────────────────────────
 
 // agentPlayer is not Resonate-specific — it's a Claude-API surface (structured
 // output + schema validation + retry/fallback). The "Resonate-shaped" code in
@@ -101,16 +121,21 @@ async function enginePlayer(_ctx: Context, fen: string, level: number): Promise<
 // replay scope to a single game. Everything below this comment is plumbing
 // around the language model; treat it as one example of an LLM player rather
 // than as Resonate guidance.
+//
+// Both players call this same function — only `side` (and so the system prompt)
+// changes. That is "fork one loop and reshape it" made literal.
 
 async function agentPlayer(
   _ctx: Context,
+  side: "w" | "b",
   fen: string,
   legalMoves: string[],
   historyText: string,
 ): Promise<AgentMove> {
+  const sideLabel = side === "w" ? "White" : "Black";
   const userMessage = [
     `FEN: ${fen}`,
-    `Side to move: Black`,
+    `Side to move: ${sideLabel}`,
     `Recent moves (SAN): ${historyText}`,
     `Legal moves (UCI): ${legalMoves.join(", ")}`,
     ``,
@@ -124,32 +149,52 @@ async function agentPlayer(
       ? `\n\nYour previous attempt was invalid: ${lastError}. Pick a move that is literally present in the legal moves list above.`
       : "";
 
-    const response = await anthropic.messages.parse({
-      model: AGENT_MODEL,
-      max_tokens: 512,
-      system: [
-        {
-          type: "text",
-          text: AGENT_SYSTEM_PROMPT,
-          cache_control: { type: "ephemeral" },
-        },
-      ],
-      messages: [{ role: "user", content: userMessage + correction }],
-      output_config: {
-        format: {
-          type: "json_schema",
-          schema: {
-            type: "object",
-            properties: {
-              move: { type: "string" },
-              reasoning: { type: "string" },
+    let response: Awaited<ReturnType<typeof anthropic.messages.parse>>;
+    try {
+      response = await anthropic.messages.parse({
+        model: AGENT_MODEL,
+        max_tokens: 512,
+        system: [
+          {
+            type: "text",
+            text: SYSTEM_PROMPTS[side],
+            cache_control: { type: "ephemeral" },
+          },
+        ],
+        messages: [{ role: "user", content: userMessage + correction }],
+        output_config: {
+          format: {
+            type: "json_schema",
+            schema: {
+              type: "object",
+              properties: {
+                move: { type: "string" },
+                reasoning: { type: "string" },
+              },
+              required: ["move", "reasoning"],
+              additionalProperties: false,
             },
-            required: ["move", "reasoning"],
-            additionalProperties: false,
           },
         },
-      },
-    });
+      });
+    } catch (apiErr) {
+      // API-level failure (429, network, revoked key, etc.) — this is NOT a
+      // bad-output retry. Log it, pause briefly, and count it as an attempt.
+      // We do NOT fall back to a random move on API errors: that would be
+      // dishonest for a "two Claude agents" demo.
+      const msg = apiErr instanceof Error ? apiErr.message : String(apiErr);
+      console.error(`[agentPlayer] API error (attempt ${attempt + 1}/${AGENT_MAX_RETRIES + 1}): ${msg}`);
+      if (attempt < AGENT_MAX_RETRIES) {
+        // Short in-function pause before the next attempt: 2s, 4s, 6s.
+        await new Promise((r) => setTimeout(r, 2000 * (attempt + 1)));
+      } else {
+        // All attempts failed with API errors — rethrow so Resonate's bounded
+        // retry policy (AGENT_RETRY_POLICY) handles the outage. The game pauses
+        // until the API recovers or the retry budget is exhausted.
+        throw apiErr;
+      }
+      continue;
+    }
 
     const parsed = response.parsed_output;
     if (!parsed) {
@@ -169,6 +214,9 @@ async function agentPlayer(
     lastError = `"${candidate}" is not in the legal moves list`;
   }
 
+  // All attempts failed due to bad model output (schema-valid but illegal /
+  // malformed move). The random fallback is appropriate here: the API is
+  // responding, the model is just confused.
   const fallback = legalMoves[Math.floor(Math.random() * legalMoves.length)];
   return {
     move: fallback,
@@ -190,7 +238,7 @@ function buildState(
   game: Chess,
   lastMove: Move | undefined,
   moveCount: number,
-  agentReasoning?: string,
+  agentReasoning?: string, // the mover's one-sentence reason — set for both sides
 ): Record<string, unknown> {
   const state: Record<string, unknown> = {
     fen: game.fen(),
@@ -217,39 +265,6 @@ function buildState(
   return state;
 }
 
-const PIECE_NAME: Record<string, string> = {
-  p: "pawn",
-  n: "knight",
-  b: "bishop",
-  r: "rook",
-  q: "queen",
-  k: "king",
-};
-
-function engineReasoning(move: Move, level: number): string {
-  const piece = PIECE_NAME[move.piece] ?? move.piece;
-  const flags = move.flags ?? "";
-
-  let action: string;
-  if (flags.includes("k")) {
-    action = "king castles kingside";
-  } else if (flags.includes("q")) {
-    action = "king castles queenside";
-  } else if (move.captured) {
-    const cap = PIECE_NAME[move.captured] ?? "piece";
-    action = `${piece} ${move.from}→${move.to} captures the ${cap}`;
-  } else {
-    action = `${piece} ${move.from}→${move.to}`;
-  }
-
-  if (move.promotion) {
-    const promoted = PIECE_NAME[move.promotion] ?? move.promotion;
-    action += `, promotes to ${promoted}`;
-  }
-
-  return `depth-${level} minimax search · ${action}.`;
-}
-
 function legalMovesUci(game: Chess): string[] {
   return game.moves({ verbose: true }).map((m) => {
     const promo = m.promotion ? m.promotion : "";
@@ -268,8 +283,8 @@ function applyUciMove(game: Chess, uci: string): Move {
   const to = uci.slice(2, 4);
   let promotion = uci.length > 4 ? uci[4] : undefined;
   if (!promotion) {
-    // js-chess-engine returns promotions without the piece; default to queen
-    // when a pawn lands on the back rank.
+    // Default under-specified promotions to a queen when a pawn reaches the
+    // back rank.
     const piece = game.get(from as Square);
     if (
       piece?.type === "p" &&

@@ -1,6 +1,6 @@
 # Chess on GCP with Resonate
 
-A live AI-vs-AI chess game powered by [Resonate](https://resonatehq.io) durable execution, running on Google Cloud Platform. White is a deterministic chess engine, Black is Claude Haiku 4.5 — each move is a durably-executed step, so if the process crashes mid-game it resumes from the next pending step instead of restarting the match.
+A live agent-vs-agent chess game powered by [Resonate](https://resonatehq.io) durable execution, running on Google Cloud Platform. Both players are Claude Haiku 4.5 — the **same durable agent loop forked twice**, differing only by system prompt (White plays aggressively, Black positionally). Each move is a durably-executed step, so if the process crashes mid-game it resumes from the next pending step instead of restarting the match.
 
 Live demo: https://resonatehq-examples.github.io/resonate-chess-gcp/
 
@@ -16,14 +16,16 @@ export function* chessGame(ctx: Context, gameNumber = 1) {
   yield* ctx.run(publish, buildState(game, undefined, moveCount));
 
   while (!game.isGameOver()) {
-    const uci = game.turn() === "w"
-      ? yield* ctx.run(enginePlayer, game.fen(), WHITE_LEVEL)
-      : (yield* ctx.run(agentPlayer, game.fen(), legalMovesUci(game), recentHistory(game))).move;
+    // Same call for both players — only the side (and so the system prompt)
+    // changes. An LLM call is just a durable step.
+    const { move: uci, reasoning } = yield* ctx.run(
+      agentPlayer, game.turn(), game.fen(), legalMovesUci(game), recentHistory(game),
+    );
 
     const move = applyUciMove(game, uci);
     moveCount++;
 
-    yield* ctx.run(publish, buildState(game, move, moveCount));
+    yield* ctx.run(publish, buildState(game, move, moveCount, reasoning));
     yield* ctx.sleep(MOVE_DELAY_MS);
   }
 
@@ -57,6 +59,8 @@ resonate invoke chess-game-<N> --func chessGame --arg <N> \
   --server <resonate-server-url> --target <function-url> --timeout 24h
 ```
 
+On an Anthropic API outage (429, network error, revoked key), `agentPlayer` retries within the function up to `AGENT_MAX_RETRIES` times, then rethrows. Resonate catches the rethrow and backs off exponentially (1 s, 2 s, 4 s … up to 60 s per attempt) for up to 15 Resonate-level retries, self-healing outages of roughly 20 minutes; beyond that the promise chain rejects and the documented manual re-seed applies. No random fallback moves are played while the API is down.
+
 `@resonatehq/gcp` defaults `ttl` (acquired-task lease) to 5min. We set it to 10min in `index.ts` so it always exceeds the Cloud Function's 540s timeout — belt-and-braces against any single invocation that legitimately runs long.
 
 ## State Bus — Firestore
@@ -75,7 +79,7 @@ Each move publishes a snapshot to Firestore at `chess/live`:
   isGameOver: boolean,
   updatedAt: number,
   lastMove?: { from: string, to: string, captured?: string },
-  agentReasoning?: string,   // Black's one-sentence reason for the move
+  agentReasoning?: string,   // the mover's one-sentence reason (set for both sides)
   result?: "white" | "black" | "draw",
 }
 ```
@@ -84,8 +88,12 @@ Browser clients subscribe via Firebase JS SDK `onSnapshot('chess/live')`. The `c
 
 ## Players
 
-- **White** — `js-chess-engine` at level 3 (pure JS, deterministic minimax). Pulled in as a Cloud Function dep, no native binary or WASM.
-- **Black** — Claude Haiku 4.5 via the Anthropic SDK. Returns `{ move, reasoning }` as structured JSON output, validated against the legal-moves list with up to 2 retries on invalid output, then falls back to a random legal move if all retries fail.
+Both players are the **same** `agentPlayer` function — one Claude Haiku 4.5 agent loop, called with a different `side`. The only thing that differs is the system prompt:
+
+- **White** — Claude Haiku 4.5, aggressive prompt (seize initiative, open lines, take tactical chances).
+- **Black** — Claude Haiku 4.5, positional prompt (solid structure, safe king, favorable trades).
+
+Each returns `{ move, reasoning }` as structured JSON output, validated against the legal-moves list with up to 2 retries on invalid output, then falls back to a random legal move if all retries fail. Same model, same tools (the legal-move list), same finish line — that's "fork one durable loop and reshape it" made literal.
 
 ## Cost Profile
 
@@ -95,9 +103,9 @@ Browser clients subscribe via Firebase JS SDK `onSnapshot('chess/live')`. The `c
 | Resonate Server | Cloud Run, 1 min instance, 256MB | ~$5/mo |
 | Chess Function | Cloud Functions Gen2, 512MB, ~5s active every ~4.5s | ~$3/mo |
 | Firestore | free tier covers hobby use | $0 |
-| Anthropic API | ~1 Haiku 4.5 call per 9s (~300k calls/mo) | **~$50–150/mo** |
+| Anthropic API | ~1 Haiku 4.5 call per ~4.5s — **both sides are now agents** (~600k calls/mo) | **~$100–300/mo** |
 
-The Anthropic line is the real cost driver — the bot runs continuously, so the spend is steady-state regardless of viewers. The range reflects uncertainty in average game length and prompt-cache hit rate. Switch the player back to engine-vs-engine (delete `agentPlayer` and route both sides to `enginePlayer`) to drop this to $0.
+The Anthropic line is the real cost driver — the bot runs continuously, so the spend is steady-state regardless of viewers. Moving from engine-vs-agent to **agent-vs-agent roughly doubles this line** (every move is now a Claude call, not every other move). The range reflects uncertainty in average game length and prompt-cache hit rate; the two distinct system prompts each cache separately. To cut cost: widen `MOVE_DELAY_MS` (fewer moves/hour), or route one side to a local engine.
 
 ## Files
 
@@ -111,8 +119,8 @@ The Anthropic line is the real cost driver — the bot runs continuously, so the
 ### One-time setup (per GCP project)
 
 ```bash
-# Anthropic API key for the Black player. Create the secret, or add a new
-# version if it already exists.
+# Anthropic API key for both players (White and Black are both Claude). Create
+# the secret, or add a new version if it already exists.
 echo -n "<ANTHROPIC_API_KEY>" | gcloud secrets create anthropic-api-key \
   --data-file=- --project=<gcp-project> \
   || echo -n "<ANTHROPIC_API_KEY>" | gcloud secrets versions add anthropic-api-key \
@@ -124,7 +132,7 @@ firebase deploy --only firestore:rules --project=<gcp-project>
 
 ### Migrating from a prior deployment (the order matters)
 
-If a `chessGame` chain is already running on the Resonate server (from a prior version of this worker), **drain it before deploying new code**. Otherwise the in-flight workflow replays through the new code path with mismatched promise value shapes (older child-promise values were plain UCI strings; new code destructures `{move, reasoning}`) and crashes with `Invalid move: undefined`, poisoning the chain.
+If a `chessGame` chain is already running on the Resonate server (from a prior version of this worker), **drain it before deploying new code**. Otherwise the in-flight workflow replays through the new code path with mismatched promise value shapes — under the old engine path White's move promise was a plain UCI `string`, but the new code always destructures `{move, reasoning}` — and crashes with `Invalid move: undefined`, poisoning the chain.
 
 ```bash
 # 1) Cancel any in-flight chain first (idempotent — safe if none exist)
@@ -166,7 +174,7 @@ resonate promises get "$SEED_ID" --server <resonate-server-url> 2>/dev/null \
   && { echo "ID $SEED_ID already exists — bump SEED_ID and retry."; exit 1; }
 
 resonate invoke "$SEED_ID" \
-  --func chessGame --data '{"args":[1]}' \
+  --func chessGame --arg 1 \
   --server <resonate-server-url> \
   --target "$FUNCTION_URL" \
   --timeout 24h
