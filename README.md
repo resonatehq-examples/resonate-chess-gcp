@@ -50,7 +50,19 @@ This shape was a deliberate fix for the **replay-vs-lease cliff (`code 1199`)**.
 
 ### Games are capped at `MAX_PLIES`
 
-Bounding replay *per game* is only enough if a single game cannot itself grow without bound. Replay does one server roundtrip per recorded step, so per-invocation time grows linearly with the ply count — and two LLMs shuffling pieces in a locked endgame can outrun the fifty-move rule for hundreds of plies. Past roughly 250 plies the replay alone exceeds the Cloud Function's 540 s request timeout: invocations die on the platform deadline (HTTP 504), the board freezes mid-game, and no retry can ever get further than the last one. `chessGame` therefore adjudicates any game that reaches `MAX_PLIES` as a draw, publishes a final game-over snapshot, and detaches into the next game, which starts with an empty replay again.
+Bounding replay *per game* is only enough if a single game cannot itself grow without bound. Replay does one server roundtrip per recorded step, so per-invocation time grows linearly with the ply count — and two LLMs shuffling pieces in a locked endgame can outrun the fifty-move rule for hundreds of plies. Once a resume can no longer reach the next step before the request timeout, invocations die on the platform deadline (HTTP 504), every retry replays the same prefix and dies the same way, the board freezes mid-game, and no retry can ever get further than the last one. `chessGame` therefore adjudicates any game that reaches `MAX_PLIES` as a draw, publishes a final game-over snapshot, and detaches into the next game, which starts with an empty replay again.
+
+Measured against a live chain, replay costs **~0.72 s per recorded step**, and each ply records three steps (agent call, publish, sleep). The resume that plays ply *p* therefore costs about `2.16 * p` seconds:
+
+| ply | predicted | observed |
+| --- | --- | --- |
+| 20 | 43 s | 41 s |
+| 60 | 130 s | 136 s |
+| 100 | 216 s | 226 s |
+| 140 | 302 s | 308 s |
+| 160 (cap) | 346 s | — |
+
+The cap alone is not the whole guard: that ~346 s at the cap has to fit inside the request timeout *alongside* the agent call and any `AGENT_MAX_RETRIES` attempts. Against the 540 s default that leaves under 200 s of margin, and a chain running to ply ~150 has been observed to exhaust it — resumes there measured ~324 s clean but spiked to ~600 s once a dying invocation and its retry stacked up, which is the freeze. The worker is therefore deployed at the **gen2 maximum `--timeout=3600s`**, giving roughly 10x headroom at the cap. A full-length game runs about 7.7 h of wall clock, comfortably inside the 24 h root-promise timeout used when seeding.
 
 Long-running self-detaching chains used to accumulate id segments per generation, which eventually overflowed server `task.suspend` payloads and froze the chain (HTTP 500 from the server on suspend) — that history is at https://github.com/resonatehq/resonate-sdk-ts/issues/526. As of SDK 0.10.4 detached ids are bounded (a pinned `resonate:prefix` tag keeps every generation one segment past the root, see https://github.com/resonatehq/resonate-sdk-ts/pull/528), so the chain runs indefinitely and re-seeding is only needed after a chain rejection (e.g. a prolonged API outage, below). To re-seed, cancel any pending `chess-game-*` promises and invoke a fresh integer suffix:
 
@@ -65,7 +77,7 @@ resonate invoke chess-game-<N> --func chessGame --arg <N> \
 
 On an Anthropic API outage (429, network error, revoked key), `agentPlayer` retries within the function up to `AGENT_MAX_RETRIES` times, then rethrows. Resonate catches the rethrow and backs off exponentially (1 s, 2 s, 4 s … up to 60 s per attempt) for up to 15 Resonate-level retries, self-healing outages of roughly 20 minutes; beyond that the promise chain rejects and the documented manual re-seed applies. No random fallback moves are played while the API is down.
 
-`@resonatehq/gcp` defaults `ttl` (acquired-task lease) to 5min. We set it to 10min in `index.ts` so it always exceeds the Cloud Function's 540s timeout — belt-and-braces against any single invocation that legitimately runs long.
+`@resonatehq/gcp` defaults `ttl` (acquired-task lease) to 5min. We set it to 65min in `index.ts` so it always exceeds the Cloud Function's 3600s timeout — belt-and-braces against any single invocation that legitimately runs long. **These two values move together.** Raising the request timeout without raising the lease lets the server reassign a task that is still running, putting two workers on the same game.
 
 ## State Bus — Firestore
 
@@ -154,7 +166,7 @@ gcloud functions deploy chess-match \
   --gen2 --region=us-central1 --runtime=nodejs22 \
   --source=. --entry-point=handler --trigger-http \
   --allow-unauthenticated \
-  --memory=512Mi --timeout=540s \
+  --memory=512Mi --timeout=3600s \
   --set-env-vars=RESONATE_URL=<resonate-server-url> \
   --set-secrets=ANTHROPIC_API_KEY=anthropic-api-key:latest \
   --project=<gcp-project>

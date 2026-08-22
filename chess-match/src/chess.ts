@@ -12,12 +12,18 @@ const GAME_PAUSE_MS = 6000;
 // Hard cap on game length, in plies. Every move adds durable steps that each
 // subsequent resume must replay, and replay does one server roundtrip per
 // recorded step — so per-invocation time grows linearly with the ply count.
-// Past roughly 250 plies the replay alone outgrows the Cloud Function's 540s
-// request timeout and the chain can no longer make progress: invocations 504
-// on the platform deadline and the board freezes mid-game. Two LLMs shuffling
-// a locked endgame can drift there long before the fifty-move rule ends the
-// game, so games that reach the cap are adjudicated as draws and the chain
-// detaches into the next game, which starts with an empty replay again.
+// Measured against a live chain: ~0.72s per recorded step, and each ply records
+// three steps (agent call, publish, sleep), so the resume that plays ply p costs
+// roughly 2.16 * p seconds. At this cap that is ~346s, and it has to fit inside
+// the Cloud Function request timeout alongside the agent call itself and any
+// AGENT_MAX_RETRIES attempts. Once a resume can no longer reach the next step
+// before the platform deadline, every retry replays the same prefix and dies the
+// same way (HTTP 504): the board freezes mid-game and no retry gets further. The
+// function is therefore deployed at the gen2 maximum 3600s timeout, which leaves
+// roughly 10x headroom at this cap. Two LLMs shuffling a locked endgame can
+// outrun the fifty-move rule for hundreds of plies, so games that reach the cap
+// are adjudicated as draws and the chain detaches into the next game, which
+// starts with an empty replay again.
 const MAX_PLIES = 160;
 
 // Both players are Claude Haiku 4.5 — the SAME agent loop, forked twice. The

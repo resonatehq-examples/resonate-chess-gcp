@@ -3,9 +3,9 @@ import { Firestore } from "@google-cloud/firestore";
 import { chessGame } from "./chess";
 
 const resonate = new Resonate({
-  // Task lease must safely exceed the Cloud Function's 540s timeout so the
+  // Task lease must safely exceed the Cloud Function's 3600s timeout so the
   // server never reassigns a task that's still running mid-invocation.
-  ttl: 10 * 60 * 1000,
+  ttl: 65 * 60 * 1000,
 });
 
 // ignoreUndefinedProperties so optional fields (lastMove, agentReasoning,
