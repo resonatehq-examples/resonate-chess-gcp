@@ -41,7 +41,9 @@ Your job each turn: look at the FEN position and the list of legal moves, pick o
 
 Rules for your output:
 - "move" must be one of the legal moves, verbatim, in UCI format (e.g. "e2e4", "g1f3", with promotion suffix like "e7e8q" when relevant).
+- Before you write the reasoning, check the FEN for which of YOUR pieces stands on the move's from-square. UCI is only a pair of squares: "c7c8" is a pawn promoting if one of your pawns is on c7, and your king stepping up if your king is there.
 - "reasoning" is ONE sentence. Be concrete — name the piece and the goal (attack, open a file, sacrifice for initiative, etc.). No filler, no hedging.
+- The piece you name in "reasoning" must be the piece you actually moved. Never describe a king move as a pawn push or a promotion, and never claim a capture on a square that is empty.
 - If you see a forced tactic (fork, pin, mate in N), take it. Otherwise prefer moves that create threats, contest the center, and keep the initiative.
 - You are White. Do not confuse yourself with Black.`;
 
@@ -51,7 +53,9 @@ Your job each turn: look at the FEN position and the list of legal moves, pick o
 
 Rules for your output:
 - "move" must be one of the legal moves, verbatim, in UCI format (e.g. "e7e5", "g8f6", with promotion suffix like "a2a1q" when relevant).
+- Before you write the reasoning, check the FEN for which of YOUR pieces stands on the move's from-square. UCI is only a pair of squares: "c2c1" is a pawn promoting if one of your pawns is on c2, and your king stepping down if your king is there.
 - "reasoning" is ONE sentence. Be concrete — name the piece and the goal (develop, defend, trade, fix a weakness, etc.). No filler, no hedging.
+- The piece you name in "reasoning" must be the piece you actually moved. Never describe a king move as a pawn push or a promotion, and never claim a capture on a square that is empty.
 - If you see a forced tactic (fork, pin, mate in N), take it. Otherwise prefer moves that develop pieces, control the center, keep your king safe, and avoid weaknesses.
 - You are Black. Do not confuse yourself with White.`;
 
@@ -162,7 +166,7 @@ async function agentPlayer(
     `Recent moves (SAN): ${historyText}`,
     `Legal moves (UCI): ${legalMoves.join(", ")}`,
     ``,
-    `Pick one move from the legal list. Respond with the JSON schema.`,
+    `Pick one move from the legal list. Answer with the bare UCI token, and make sure your reasoning names the piece you are actually moving. Respond with the JSON schema.`,
   ].join("\n");
 
   let lastError: string | null = null;
@@ -301,6 +305,12 @@ function adjudicatedDrawState(game: Chess, moveCount: number): Record<string, un
   return state;
 }
 
+// UCI only. A coordinate pair carries no piece identity — "c7c8" is a king
+// stepping up or a pawn promoting, and the agent has to read the from-square off
+// the FEN to know which. Annotating each entry with its SAN was measurably worse:
+// it did not improve the narration and it pulled move choice away from the best
+// move in sparse endgames, so the piece-identity problem is handled in the system
+// prompt instead. See the "reasoning must name the piece you moved" rules above.
 function legalMovesUci(game: Chess): string[] {
   return game.moves({ verbose: true }).map((m) => {
     const promo = m.promotion ? m.promotion : "";
